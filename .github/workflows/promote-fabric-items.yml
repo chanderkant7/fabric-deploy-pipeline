@@ -13,11 +13,6 @@ on:
         required: true
         default: "fabric-release"
         type: string
-      approve_prod_promotion:
-        description: "Promote to Production (requires 'production' Environment approval)"
-        required: true
-        default: true
-        type: boolean
 
 jobs:
   promote-dev-to-test:
@@ -102,7 +97,6 @@ jobs:
   promote-test-to-prod:
     name: "Stage 2: Human Approval & Selective Batch Promote Test -> Prod"
     needs: promote-dev-to-test
-    if: ${{ inputs.approve_prod_promotion == true }}
     runs-on: ubuntu-latest
     environment: production
     steps:
