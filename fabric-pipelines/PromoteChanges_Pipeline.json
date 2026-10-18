@@ -1,0 +1,412 @@
+{
+    "name": "PromoteChanges_Pipeline",
+    "objectId": "22d589fc-999f-411b-bdf2-514fd1b1d5b8",
+    "properties": {
+        "activities": [
+            {
+                "name": "ListDeploymentPipelines",
+                "type": "WebActivity",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 2,
+                    "retryIntervalInSeconds": 15,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "method": "GET",
+                    "relativeUrl": "/v1/deploymentPipelines"
+                },
+                "externalReferences": {
+                    "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                }
+            },
+            {
+                "name": "FilterTargetPipeline",
+                "type": "Filter",
+                "dependsOn": [
+                    {
+                        "activity": "ListDeploymentPipelines",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('ListDeploymentPipelines').output.value",
+                        "type": "Expression"
+                    },
+                    "condition": {
+                        "value": "@equals(item().displayName, pipeline().parameters.pipelineName)",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "GetStages",
+                "type": "WebActivity",
+                "dependsOn": [
+                    {
+                        "activity": "FilterTargetPipeline",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 2,
+                    "retryIntervalInSeconds": 15,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "method": "GET",
+                    "relativeUrl": {
+                        "value": "@concat('/v1/deploymentPipelines/', activity('FilterTargetPipeline').output.value[0].id, '/stages')",
+                        "type": "Expression"
+                    }
+                },
+                "externalReferences": {
+                    "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                }
+            },
+            {
+                "name": "GetDevStageItems",
+                "type": "WebActivity",
+                "dependsOn": [
+                    {
+                        "activity": "GetStages",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 2,
+                    "retryIntervalInSeconds": 15,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "method": "GET",
+                    "relativeUrl": {
+                        "value": "@concat('/v1/deploymentPipelines/', activity('FilterTargetPipeline').output.value[0].id, '/stages/', activity('GetStages').output.value[0].id, '/items')",
+                        "type": "Expression"
+                    }
+                },
+                "externalReferences": {
+                    "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                }
+            },
+            {
+                "name": "FilterDevItems",
+                "type": "Filter",
+                "dependsOn": [
+                    {
+                        "activity": "GetDevStageItems",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('GetDevStageItems').output.value",
+                        "type": "Expression"
+                    },
+                    "condition": {
+                        "value": "@contains(split(replace(pipeline().parameters.itemIds, ' ', ''), ','), item().itemId)",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "BuildDevDeployPayload",
+                "type": "ForEach",
+                "dependsOn": [
+                    {
+                        "activity": "FilterDevItems",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('FilterDevItems').output.value",
+                        "type": "Expression"
+                    },
+                    "isSequential": false,
+                    "activities": [
+                        {
+                            "name": "AppendDevItem",
+                            "type": "AppendVariable",
+                            "dependsOn": [],
+                            "typeProperties": {
+                                "variableName": "devDeployItems",
+                                "value": {
+                                    "value": "@json(concat('{\"sourceItemId\":\"', item().itemId, '\",\"itemType\":\"', item().itemType, '\"}'))",
+                                    "type": "Expression"
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "PromoteDevToTest",
+                "type": "WebActivity",
+                "dependsOn": [
+                    {
+                        "activity": "BuildDevDeployPayload",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 2,
+                    "retryIntervalInSeconds": 15,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "method": "POST",
+                    "headers": {
+                        "Content-Type": "application/json"
+                    },
+                    "relativeUrl": {
+                        "value": "@concat('/v1/deploymentPipelines/', activity('FilterTargetPipeline').output.value[0].id, '/deploy')",
+                        "type": "Expression"
+                    },
+                    "body": {
+                        "value": "@concat('{\"sourceStageId\":\"', activity('GetStages').output.value[0].id, '\",\"targetStageId\":\"', activity('GetStages').output.value[1].id, '\",\"items\":', string(variables('devDeployItems')), '}')",
+                        "type": "Expression"
+                    }
+                },
+                "externalReferences": {
+                    "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                }
+            },
+            {
+                "name": "WaitForDevToTestDeploy",
+                "type": "Until",
+                "dependsOn": [
+                    {
+                        "activity": "PromoteDevToTest",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@equals(activity('GetLatestDeployOp').output.value[0].status, 'Succeeded')",
+                        "type": "Expression"
+                    },
+                    "timeout": "0.00:10:00",
+                    "activities": [
+                        {
+                            "name": "Wait10s",
+                            "type": "Wait",
+                            "dependsOn": [],
+                            "typeProperties": {
+                                "waitTimeInSeconds": 10
+                            }
+                        },
+                        {
+                            "name": "GetLatestDeployOp",
+                            "type": "WebActivity",
+                            "dependsOn": [
+                                {
+                                    "activity": "Wait10s",
+                                    "dependencyConditions": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            ],
+                            "policy": {
+                                "timeout": "0.12:00:00",
+                                "retry": 2,
+                                "retryIntervalInSeconds": 15,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "method": "GET",
+                                "relativeUrl": {
+                                    "value": "@concat('/v1/deploymentPipelines/', activity('FilterTargetPipeline').output.value[0].id, '/operations')",
+                                    "type": "Expression"
+                                }
+                            },
+                            "externalReferences": {
+                                "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "GetTestStageItems",
+                "type": "WebActivity",
+                "dependsOn": [
+                    {
+                        "activity": "WaitForDevToTestDeploy",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 2,
+                    "retryIntervalInSeconds": 15,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "method": "GET",
+                    "relativeUrl": {
+                        "value": "@concat('/v1/deploymentPipelines/', activity('FilterTargetPipeline').output.value[0].id, '/stages/', activity('GetStages').output.value[1].id, '/items')",
+                        "type": "Expression"
+                    }
+                },
+                "externalReferences": {
+                    "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                }
+            },
+            {
+                "name": "FilterTestItems",
+                "type": "Filter",
+                "dependsOn": [
+                    {
+                        "activity": "GetTestStageItems",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('GetTestStageItems').output.value",
+                        "type": "Expression"
+                    },
+                    "condition": {
+                        "value": "@contains(split(replace(pipeline().parameters.itemIds, ' ', ''), ','), item().sourceItemId)",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "BuildTestDeployPayload",
+                "type": "ForEach",
+                "dependsOn": [
+                    {
+                        "activity": "FilterTestItems",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('FilterTestItems').output.value",
+                        "type": "Expression"
+                    },
+                    "isSequential": false,
+                    "activities": [
+                        {
+                            "name": "AppendTestItem",
+                            "type": "AppendVariable",
+                            "dependsOn": [],
+                            "typeProperties": {
+                                "variableName": "testDeployItems",
+                                "value": {
+                                    "value": "@json(concat('{\"sourceItemId\":\"', item().itemId, '\",\"itemType\":\"', item().itemType, '\"}'))",
+                                    "type": "Expression"
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "CheckProdApproval",
+                "type": "IfCondition",
+                "dependsOn": [
+                    {
+                        "activity": "BuildTestDeployPayload",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@bool(pipeline().parameters.approveProdPromotion)",
+                        "type": "Expression"
+                    },
+                    "ifFalseActivities": [],
+                    "ifTrueActivities": [
+                        {
+                            "name": "PromoteTestToProd",
+                            "type": "WebActivity",
+                            "dependsOn": [],
+                            "policy": {
+                                "timeout": "0.12:00:00",
+                                "retry": 2,
+                                "retryIntervalInSeconds": 15,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "method": "POST",
+                                "headers": {
+                                    "Content-Type": "application/json"
+                                },
+                                "relativeUrl": {
+                                    "value": "@concat('/v1/deploymentPipelines/', activity('FilterTargetPipeline').output.value[0].id, '/deploy')",
+                                    "type": "Expression"
+                                },
+                                "body": {
+                                    "value": "@concat('{\"sourceStageId\":\"', activity('GetStages').output.value[1].id, '\",\"targetStageId\":\"', activity('GetStages').output.value[2].id, '\",\"items\":', string(variables('testDeployItems')), '}')",
+                                    "type": "Expression"
+                                }
+                            },
+                            "externalReferences": {
+                                "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "itemIds": {
+                "type": "string",
+                "defaultValue": "349a9425-6aec-45f7-b93b-43a438949cfe,2ce38647-cf28-4138-b6f9-e0b6eb94ce02,dd26891d-16d9-45ba-a366-89a5b0d25f4f,42fc1537-a175-4cb7-9ab3-014c0e8cea36"
+            },
+            "approveProdPromotion": {
+                "type": "bool",
+                "defaultValue": true
+            },
+            "pipelineName": {
+                "type": "string",
+                "defaultValue": "fabric-release"
+            }
+        },
+        "variables": {
+            "devDeployItems": {
+                "type": "Array"
+            },
+            "testDeployItems": {
+                "type": "Array"
+            }
+        }
+    }
+}

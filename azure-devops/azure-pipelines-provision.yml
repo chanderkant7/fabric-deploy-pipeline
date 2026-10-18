@@ -1,0 +1,112 @@
+trigger: none
+
+parameters:
+  - name: pipelineName
+    displayName: 'Fabric Deployment Pipeline Name'
+    type: string
+    default: 'fabric-release'
+  - name: devWorkspaceId
+    displayName: 'Development Workspace ID'
+    type: string
+    default: '2983c42e-9f8c-4c2e-92d8-e159ae9ce3ee'
+  - name: testWorkspaceId
+    displayName: 'Test Workspace ID'
+    type: string
+    default: '3e0528a8-64d6-4dbb-9f19-95a46e26e20b'
+  - name: prodWorkspaceId
+    displayName: 'Production Workspace ID'
+    type: string
+    default: 'c3d0859b-e6b8-47bb-98ff-946392daa775'
+  - name: adminGroupId
+    displayName: 'Entra AD Security Group ID (Pipeline Admin)'
+    type: string
+    default: 'f5d6ad5d-6f85-41fb-aa96-5aac2c4514de'
+
+variables:
+  - group: fabric-spn-credentials # Contains FABRIC_TENANT_ID, FABRIC_CLIENT_ID, FABRIC_CLIENT_SECRET
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  - stage: ProvisionDeploymentPipeline
+    displayName: 'Provision & Map Fabric Deployment Pipeline'
+    jobs:
+      - job: ProvisionAndMap
+        displayName: 'Idempotent Create, Role Assignment & Workspace Mapping'
+        steps:
+          - task: PowerShell@2
+            displayName: 'Create Deployment Pipeline, Assign Group Role & Map Stages'
+            env:
+              TENANT_ID: $(FABRIC_TENANT_ID)
+              CLIENT_ID: $(FABRIC_CLIENT_ID)
+              CLIENT_SECRET: $(FABRIC_CLIENT_SECRET)
+            inputs:
+              targetType: 'inline'
+              pwsh: true
+              script: |
+                $ErrorActionPreference = 'Stop'
+
+                # 1. Acquire Fabric API Token via Service Principal
+                $tokenBody = @{
+                    client_id     = $env:CLIENT_ID
+                    client_secret = $env:CLIENT_SECRET
+                    scope         = 'https://api.fabric.microsoft.com/.default'
+                    grant_type    = 'client_credentials'
+                }
+                $tokenResp = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$($env:TENANT_ID)/oauth2/v2.0/token" -Body $tokenBody
+                $headers = @{
+                    Authorization  = "Bearer $($tokenResp.access_token)"
+                    'Content-Type' = 'application/json'
+                }
+
+                $pipelineName = '${{ parameters.pipelineName }}'
+                $baseUrl = 'https://api.fabric.microsoft.com/v1'
+
+                # 2. Idempotent Check: List existing deployment pipelines
+                $existingList = (Invoke-RestMethod -Method Get -Uri "$baseUrl/deploymentPipelines" -Headers $headers).value
+                $pipeline = $existingList | Where-Object { $_.displayName -eq $pipelineName } | Select-Object -First 1
+
+                if ($null -ne $pipeline) {
+                    Write-Host "Deployment pipeline '$pipelineName' already exists (ID: $($pipeline.id)). Skipping creation."
+                    exit 0
+                }
+
+                # 3. Create Deployment Pipeline
+                $createBody = @{
+                    displayName = $pipelineName
+                    stages      = @(
+                        @{ displayName = 'Development'; isPublic = $false },
+                        @{ displayName = 'Test';        isPublic = $false },
+                        @{ displayName = 'Production';  isPublic = $true  }
+                    )
+                } | ConvertTo-Json -Depth 5
+
+                $created = Invoke-RestMethod -Method Post -Uri "$baseUrl/deploymentPipelines" -Headers $headers -Body $createBody
+                $pipelineId = $created.id
+                Write-Host "Created Deployment Pipeline '$pipelineName' with ID: $pipelineId"
+
+                # 4. Grant Pipeline Admin Role to Entra Security Group
+                $roleBody = @{
+                    principal = @{
+                        id   = '${{ parameters.adminGroupId }}'
+                        type = 'Group'
+                    }
+                    role = 'Admin'
+                } | ConvertTo-Json -Depth 5
+
+                Invoke-RestMethod -Method Post -Uri "$baseUrl/deploymentPipelines/$pipelineId/roleAssignments" -Headers $headers -Body $roleBody | Out-Null
+                Write-Host "Assigned Admin role to Group ${{ parameters.adminGroupId }}"
+
+                # 5. Sequentially Map Workspaces to Stages (Dev -> Test -> Prod)
+                $stageMappings = @(
+                    @{ stageId = $created.stages[0].id; name = 'Development'; workspaceId = '${{ parameters.devWorkspaceId }}' },
+                    @{ stageId = $created.stages[1].id; name = 'Test';        workspaceId = '${{ parameters.testWorkspaceId }}' },
+                    @{ stageId = $created.stages[2].id; name = 'Production';  workspaceId = '${{ parameters.prodWorkspaceId }}' }
+                )
+
+                foreach ($map in $stageMappings) {
+                    $assignBody = @{ workspaceId = $map.workspaceId } | ConvertTo-Json
+                    Invoke-RestMethod -Method Post -Uri "$baseUrl/deploymentPipelines/$pipelineId/stages/$($map.stageId)/assignWorkspace" -Headers $headers -Body $assignBody | Out-Null
+                    Write-Host "Mapped stage '$($map.name)' ($($map.stageId)) -> Workspace $($map.workspaceId)"
+                }

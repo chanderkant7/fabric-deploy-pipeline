@@ -1,0 +1,262 @@
+{
+    "name": "CICD_Pipeline",
+    "objectId": "531c6e5a-c4b2-4abd-be0d-ae4ea953c2b2",
+    "properties": {
+        "activities": [
+            {
+                "name": "ListDeploymentPipelines",
+                "type": "WebActivity",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 2,
+                    "retryIntervalInSeconds": 15,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "method": "GET",
+                    "relativeUrl": "/v1/deploymentPipelines"
+                },
+                "externalReferences": {
+                    "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                }
+            },
+            {
+                "name": "FilterExistingPipeline",
+                "type": "Filter",
+                "dependsOn": [
+                    {
+                        "activity": "ListDeploymentPipelines",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('ListDeploymentPipelines').output.value",
+                        "type": "Expression"
+                    },
+                    "condition": {
+                        "value": "@equals(item().displayName, pipeline().parameters.pipelineName)",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "CreateIfMissing",
+                "type": "IfCondition",
+                "dependsOn": [
+                    {
+                        "activity": "FilterExistingPipeline",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@equals(length(activity('FilterExistingPipeline').output.value), 0)",
+                        "type": "Expression"
+                    },
+                    "ifFalseActivities": [],
+                    "ifTrueActivities": [
+                        {
+                            "name": "CreateDeploymentPipeline",
+                            "type": "WebActivity",
+                            "dependsOn": [],
+                            "policy": {
+                                "timeout": "0.12:00:00",
+                                "retry": 2,
+                                "retryIntervalInSeconds": 15,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "method": "POST",
+                                "headers": {
+                                    "Content-Type": "application/json"
+                                },
+                                "relativeUrl": "/v1/deploymentPipelines",
+                                "body": {
+                                    "value": "@concat('{\"displayName\":\"', pipeline().parameters.pipelineName, '\",\"stages\":[{\"displayName\":\"Development\",\"isPublic\":false},{\"displayName\":\"Test\",\"isPublic\":false},{\"displayName\":\"Production\",\"isPublic\":true}]}')",
+                                    "type": "Expression"
+                                }
+                            },
+                            "externalReferences": {
+                                "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                            }
+                        },
+                        {
+                            "name": "AssignRoles",
+                            "type": "WebActivity",
+                            "dependsOn": [
+                                {
+                                    "activity": "CreateDeploymentPipeline",
+                                    "dependencyConditions": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            ],
+                            "policy": {
+                                "timeout": "0.12:00:00",
+                                "retry": 2,
+                                "retryIntervalInSeconds": 15,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "method": "POST",
+                                "headers": {
+                                    "Content-Type": "application/json"
+                                },
+                                "relativeUrl": {
+                                    "value": "@concat('/v1/deploymentPipelines/', activity('CreateDeploymentPipeline').output.id, '/roleAssignments')",
+                                    "type": "Expression"
+                                },
+                                "body": {
+                                    "value": "@concat('{\"principal\":{\"id\":\"', pipeline().parameters.adminGroupId, '\",\"type\":\"Group\"},\"role\":\"Admin\"}')",
+                                    "type": "Expression"
+                                }
+                            },
+                            "externalReferences": {
+                                "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                            }
+                        },
+                        {
+                            "name": "AssignDevWorkspace",
+                            "type": "WebActivity",
+                            "dependsOn": [
+                                {
+                                    "activity": "AssignRoles",
+                                    "dependencyConditions": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            ],
+                            "policy": {
+                                "timeout": "0.12:00:00",
+                                "retry": 2,
+                                "retryIntervalInSeconds": 15,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "method": "POST",
+                                "headers": {
+                                    "Content-Type": "application/json"
+                                },
+                                "relativeUrl": {
+                                    "value": "@concat('/v1/deploymentPipelines/', activity('CreateDeploymentPipeline').output.id, '/stages/', activity('CreateDeploymentPipeline').output.stages[0].id, '/assignWorkspace')",
+                                    "type": "Expression"
+                                },
+                                "body": {
+                                    "value": "@concat('{\"workspaceId\":\"', pipeline().parameters.devWorkspaceId, '\"}')",
+                                    "type": "Expression"
+                                }
+                            },
+                            "externalReferences": {
+                                "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                            }
+                        },
+                        {
+                            "name": "AssignTestWorkspace",
+                            "type": "WebActivity",
+                            "dependsOn": [
+                                {
+                                    "activity": "AssignDevWorkspace",
+                                    "dependencyConditions": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            ],
+                            "policy": {
+                                "timeout": "0.12:00:00",
+                                "retry": 2,
+                                "retryIntervalInSeconds": 15,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "method": "POST",
+                                "headers": {
+                                    "Content-Type": "application/json"
+                                },
+                                "relativeUrl": {
+                                    "value": "@concat('/v1/deploymentPipelines/', activity('CreateDeploymentPipeline').output.id, '/stages/', activity('CreateDeploymentPipeline').output.stages[1].id, '/assignWorkspace')",
+                                    "type": "Expression"
+                                },
+                                "body": {
+                                    "value": "@concat('{\"workspaceId\":\"', pipeline().parameters.testWorkspaceId, '\"}')",
+                                    "type": "Expression"
+                                }
+                            },
+                            "externalReferences": {
+                                "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                            }
+                        },
+                        {
+                            "name": "AssignProdWorkspace",
+                            "type": "WebActivity",
+                            "dependsOn": [
+                                {
+                                    "activity": "AssignTestWorkspace",
+                                    "dependencyConditions": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            ],
+                            "policy": {
+                                "timeout": "0.12:00:00",
+                                "retry": 2,
+                                "retryIntervalInSeconds": 15,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "method": "POST",
+                                "headers": {
+                                    "Content-Type": "application/json"
+                                },
+                                "relativeUrl": {
+                                    "value": "@concat('/v1/deploymentPipelines/', activity('CreateDeploymentPipeline').output.id, '/stages/', activity('CreateDeploymentPipeline').output.stages[2].id, '/assignWorkspace')",
+                                    "type": "Expression"
+                                },
+                                "body": {
+                                    "value": "@concat('{\"workspaceId\":\"', pipeline().parameters.prodWorkspaceId, '\"}')",
+                                    "type": "Expression"
+                                }
+                            },
+                            "externalReferences": {
+                                "connection": "cd2cc7df-03a1-43d4-b18a-20da0c8a0c02"
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "pipelineName": {
+                "type": "string",
+                "defaultValue": "fabric-release"
+            },
+            "devWorkspaceId": {
+                "type": "string",
+                "defaultValue": "2983c42e-9f8c-4c2e-92d8-e159ae9ce3ee"
+            },
+            "testWorkspaceId": {
+                "type": "string",
+                "defaultValue": "3e0528a8-64d6-4dbb-9f19-95a46e26e20b"
+            },
+            "prodWorkspaceId": {
+                "type": "string",
+                "defaultValue": "c3d0859b-e6b8-47bb-98ff-946392daa775"
+            },
+            "adminGroupId": {
+                "type": "string",
+                "defaultValue": "f5d6ad5d-6f85-41fb-aa96-5aac2c4514de"
+            }
+        }
+    }
+}
