@@ -1,0 +1,204 @@
+image: mcr.microsoft.com/powershell:latest
+
+stages:
+  - provision
+  - promote_to_test
+  - promote_to_prod
+
+variables:
+  PIPELINE_NAME:
+    value: "fabric-release"
+    description: "Fabric Deployment Pipeline Name"
+  ITEM_IDS:
+    value: "349a9425-6aec-45f7-b93b-43a438949cfe,2ce38647-cf28-4138-b6f9-e0b6eb94ce02,dd26891d-16d9-45ba-a366-89a5b0d25f4f,42fc1537-a175-4cb7-9ab3-014c0e8cea36"
+    description: "Comma-separated Dev Fabric Item IDs to promote"
+  DEV_WORKSPACE_ID:
+    value: "2983c42e-9f8c-4c2e-92d8-e159ae9ce3ee"
+    description: "Development Workspace ID"
+  TEST_WORKSPACE_ID:
+    value: "3e0528a8-64d6-4dbb-9f19-95a46e26e20b"
+    description: "Test Workspace ID"
+  PROD_WORKSPACE_ID:
+    value: "c3d0859b-e6b8-47bb-98ff-946392daa775"
+    description: "Production Workspace ID"
+  ADMIN_GROUP_ID:
+    value: "f5d6ad5d-6f85-41fb-aa96-5aac2c4514de"
+    description: "Entra AD Security Group ID (Pipeline Admin)"
+  FABRIC_TENANT_ID: "17f6730e-136d-4e04-baae-83b818a6d047"
+  FABRIC_CLIENT_ID: "9b384026-bd4f-4389-90af-918479bd3166"
+
+# Stage 1: Idempotent Provisioning, Role Assignment & Workspace Mapping
+provision_deployment_pipeline:
+  stage: provision
+  script:
+    - pwsh -NoProfile -NonInteractive -Command '
+        $ErrorActionPreference = "Stop";
+        $tokenBody = @{
+            client_id     = $env:FABRIC_CLIENT_ID
+            client_secret = $env:FABRIC_CLIENT_SECRET
+            scope         = "https://api.fabric.microsoft.com/.default"
+            grant_type    = "client_credentials"
+        };
+        $tokenResp = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$($env:FABRIC_TENANT_ID)/oauth2/v2.0/token" -Body $tokenBody;
+        $headers = @{
+            Authorization  = "Bearer $($tokenResp.access_token)"
+            "Content-Type" = "application/json"
+        };
+        $baseUrl = "https://api.fabric.microsoft.com/v1";
+        $pipelineName = $env:PIPELINE_NAME;
+
+        $existing = (Invoke-RestMethod -Method Get -Uri "$baseUrl/deploymentPipelines" -Headers $headers).value |
+            Where-Object { $_.displayName -eq $pipelineName } | Select-Object -First 1;
+        if ($null -ne $existing) {
+            Write-Host "Deployment pipeline $pipelineName already exists (ID: $($existing.id)). Skipping creation.";
+            exit 0;
+        }
+
+        $createBody = @{
+            displayName = $pipelineName
+            stages      = @(
+                @{ displayName = "Development"; isPublic = $false },
+                @{ displayName = "Test";        isPublic = $false },
+                @{ displayName = "Production";  isPublic = $true  }
+            )
+        } | ConvertTo-Json -Depth 5;
+
+        $created = Invoke-RestMethod -Method Post -Uri "$baseUrl/deploymentPipelines" -Headers $headers -Body $createBody;
+        $pipelineId = $created.id;
+        Write-Host "Created Deployment Pipeline $pipelineName with ID: $pipelineId";
+
+        $roleBody = @{
+            principal = @{ id = $env:ADMIN_GROUP_ID; type = "Group" }
+            role      = "Admin"
+        } | ConvertTo-Json -Depth 5;
+        Invoke-RestMethod -Method Post -Uri "$baseUrl/deploymentPipelines/$pipelineId/roleAssignments" -Headers $headers -Body $roleBody | Out-Null;
+        Write-Host "Assigned Admin role to Group $($env:ADMIN_GROUP_ID)";
+
+        $mappings = @(
+            @{ stageId = $created.stages[0].id; name = "Development"; wsId = $env:DEV_WORKSPACE_ID },
+            @{ stageId = $created.stages[1].id; name = "Test";        wsId = $env:TEST_WORKSPACE_ID },
+            @{ stageId = $created.stages[2].id; name = "Production";  wsId = $env:PROD_WORKSPACE_ID }
+        );
+        foreach ($m in $mappings) {
+            $b = @{ workspaceId = $m.wsId } | ConvertTo-Json;
+            Invoke-RestMethod -Method Post -Uri "$baseUrl/deploymentPipelines/$pipelineId/stages/$($m.stageId)/assignWorkspace" -Headers $headers -Body $b | Out-Null;
+            Write-Host "Mapped stage $($m.name) ($($m.stageId)) -> Workspace $($m.wsId)";
+        }
+      '
+
+# Stage 2: Auto-Detect Item Types & Batch Promote Dev -> Test
+promote_dev_to_test:
+  stage: promote_to_test
+  needs:
+    - provision_deployment_pipeline
+  script:
+    - pwsh -NoProfile -NonInteractive -Command '
+        $ErrorActionPreference = "Stop";
+        $tokenBody = @{
+            client_id     = $env:FABRIC_CLIENT_ID
+            client_secret = $env:FABRIC_CLIENT_SECRET
+            scope         = "https://api.fabric.microsoft.com/.default"
+            grant_type    = "client_credentials"
+        };
+        $tokenResp = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$($env:FABRIC_TENANT_ID)/oauth2/v2.0/token" -Body $tokenBody;
+        $headers = @{
+            Authorization  = "Bearer $($tokenResp.access_token)"
+            "Content-Type" = "application/json"
+        };
+        $baseUrl = "https://api.fabric.microsoft.com/v1";
+        $pipelineName = $env:PIPELINE_NAME;
+
+        $pipeline = (Invoke-RestMethod -Method Get -Uri "$baseUrl/deploymentPipelines" -Headers $headers).value |
+            Where-Object { $_.displayName -eq $pipelineName } | Select-Object -First 1;
+        if ($null -eq $pipeline) { throw "Deployment pipeline $pipelineName not found." }
+        $pipelineId = $pipeline.id;
+
+        $stages = (Invoke-RestMethod -Method Get -Uri "$baseUrl/deploymentPipelines/$pipelineId/stages" -Headers $headers).value;
+        $devStageId  = $stages[0].id;
+        $testStageId = $stages[1].id;
+
+        $requestedIds = ($env:ITEM_IDS -replace "\s+", "") -split ",";
+        $devStageItems = (Invoke-RestMethod -Method Get -Uri "$baseUrl/deploymentPipelines/$pipelineId/stages/$devStageId/items" -Headers $headers).value;
+
+        $deployItems = @();
+        foreach ($item in $devStageItems) {
+            if ($requestedIds -contains $item.itemId) {
+                $deployItems += @{ sourceItemId = $item.itemId; itemType = $item.itemType };
+                Write-Host "Selected for Dev -> Test: $($item.itemDisplayName) ($($item.itemType), ID: $($item.itemId))";
+            }
+        }
+        if ($deployItems.Count -eq 0) { throw "None of the requested ITEM_IDS were found in Development stage." }
+
+        $deployBody = @{ sourceStageId = $devStageId; targetStageId = $testStageId; items = $deployItems } | ConvertTo-Json -Depth 5;
+        Invoke-RestMethod -Method Post -Uri "$baseUrl/deploymentPipelines/$pipelineId/deploy" -Headers $headers -Body $deployBody | Out-Null;
+        Write-Host "Triggered batch deployment from Dev to Test. Polling operation status...";
+
+        while ($true) {
+            Start-Sleep -Seconds 10;
+            $latestOp = (Invoke-RestMethod -Method Get -Uri "$baseUrl/deploymentPipelines/$pipelineId/operations" -Headers $headers).value | Select-Object -First 1;
+            Write-Host "Operation $($latestOp.id) status: $($latestOp.status)";
+            if ($latestOp.status -eq "Succeeded") { break }
+            if ($latestOp.status -eq "Failed") { throw "Dev -> Test deployment failed." }
+        }
+        Write-Host "Successfully promoted $($deployItems.Count) item(s) to Test.";
+      '
+
+# Stage 3: In-Pipeline Human Approval Gate & Selective Batch Promote Test -> Prod
+promote_test_to_prod:
+  stage: promote_to_prod
+  needs:
+    - promote_dev_to_test
+  when: manual
+  allow_failure: false
+  environment:
+    name: production
+  script:
+    - pwsh -NoProfile -NonInteractive -Command '
+        $ErrorActionPreference = "Stop";
+        $tokenBody = @{
+            client_id     = $env:FABRIC_CLIENT_ID
+            client_secret = $env:FABRIC_CLIENT_SECRET
+            scope         = "https://api.fabric.microsoft.com/.default"
+            grant_type    = "client_credentials"
+        };
+        $tokenResp = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$($env:FABRIC_TENANT_ID)/oauth2/v2.0/token" -Body $tokenBody;
+        $headers = @{
+            Authorization  = "Bearer $($tokenResp.access_token)"
+            "Content-Type" = "application/json"
+        };
+        $baseUrl = "https://api.fabric.microsoft.com/v1";
+        $pipelineName = $env:PIPELINE_NAME;
+
+        $pipeline = (Invoke-RestMethod -Method Get -Uri "$baseUrl/deploymentPipelines" -Headers $headers).value |
+            Where-Object { $_.displayName -eq $pipelineName } | Select-Object -First 1;
+        $pipelineId = $pipeline.id;
+
+        $stages = (Invoke-RestMethod -Method Get -Uri "$baseUrl/deploymentPipelines/$pipelineId/stages" -Headers $headers).value;
+        $testStageId = $stages[1].id;
+        $prodStageId = $stages[2].id;
+
+        $requestedDevIds = ($env:ITEM_IDS -replace "\s+", "") -split ",";
+        $testStageItems = (Invoke-RestMethod -Method Get -Uri "$baseUrl/deploymentPipelines/$pipelineId/stages/$testStageId/items" -Headers $headers).value;
+
+        $prodDeployItems = @();
+        foreach ($item in $testStageItems) {
+            if ($requestedDevIds -contains $item.sourceItemId) {
+                $prodDeployItems += @{ sourceItemId = $item.itemId; itemType = $item.itemType };
+                Write-Host "Selected for Test -> Prod: $($item.itemDisplayName) ($($item.itemType), Test ID: $($item.itemId))";
+            }
+        }
+        if ($prodDeployItems.Count -eq 0) { throw "No matching items found in Test stage for the provided Dev ITEM_IDS." }
+
+        $deployBody = @{ sourceStageId = $testStageId; targetStageId = $prodStageId; items = $prodDeployItems } | ConvertTo-Json -Depth 5;
+        Invoke-RestMethod -Method Post -Uri "$baseUrl/deploymentPipelines/$pipelineId/deploy" -Headers $headers -Body $deployBody | Out-Null;
+        Write-Host "Triggered batch deployment from Test to Prod. Polling operation status...";
+
+        while ($true) {
+            Start-Sleep -Seconds 10;
+            $latestOp = (Invoke-RestMethod -Method Get -Uri "$baseUrl/deploymentPipelines/$pipelineId/operations" -Headers $headers).value | Select-Object -First 1;
+            Write-Host "Operation $($latestOp.id) status: $($latestOp.status)";
+            if ($latestOp.status -eq "Succeeded") { break }
+            if ($latestOp.status -eq "Failed") { throw "Test -> Prod deployment failed." }
+        }
+        Write-Host "Successfully promoted $($prodDeployItems.Count) item(s) to Production.";
+      '
